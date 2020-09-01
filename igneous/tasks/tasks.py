@@ -1,7 +1,7 @@
 from __future__ import print_function
 
 from collections import defaultdict
-from collections.abc import Sequence
+from cloudvolume.txrx import content_type
 
 try:
   from StringIO import cStringIO as BytesIO
@@ -13,7 +13,6 @@ import math
 import os
 import random
 import re
-import pickle
 # from tempfile import NamedTemporaryFile  # used by BigArrayTask
 
 # from backports import lzma               # used by HyperSquareTask
@@ -23,64 +22,57 @@ import pickle
 import numpy as np
 from tqdm import tqdm
 
-from cloudvolume import CloudVolume
-from cloudvolume.storage import Storage, SimpleStorage
-from cloudvolume.lib import min2, Vec, Bbox, mkdir, jsonify
+from cloudvolume import CloudVolume, Storage
+from cloudvolume.lib import min2, Vec, Bbox, mkdir
 from taskqueue import RegisteredTask
 
-from igneous import chunks, downsample_scales
-
-import DracoPy
-import fastremap
-import tinybrain
-import zmesh
+from igneous import chunks, downsample, downsample_scales
+from igneous import Mesher  # broken out for ease of commenting out
 
 def downsample_and_upload(
     image, bounds, vol, ds_shape, 
     mip=0, axis='z', skip_first=False,
-    sparse=False, factor=None
+    sparse=False
   ):
     ds_shape = min2(vol.volume_size, ds_shape[:3])
-    underlying_mip = (mip + 1) if (mip + 1) in vol.available_mips else mip
-    chunk_size = vol.meta.chunk_size(underlying_mip).astype(np.float32)
 
-    if factor is None:
-      factor = downsample_scales.axis_to_factor(axis)
-    factors = downsample_scales.compute_factors(ds_shape, factor, chunk_size)
+    # sometimes we downsample a base layer of 512x512
+    # into underlying chunks of 64x64 which permits more scales
+    underlying_mip = (mip + 1) if (mip + 1) in vol.available_mips else mip
+    underlying_shape = vol.mip_underlying(underlying_mip).astype(np.float32)
+    toidx = {'x': 0, 'y': 1, 'z': 2}
+    preserved_idx = toidx[axis]
+    underlying_shape[preserved_idx] = float('inf')
+
+    # Need to use ds_shape here. Using image bounds means truncated
+    # edges won't generate as many mip levels
+    fullscales = downsample_scales.compute_plane_downsampling_scales(
+      size=ds_shape,
+      preserve_axis=axis,
+      max_downsampled_size=int(min(*underlying_shape)),
+    )
+    factors = downsample.scale_series_to_downsample_factors(fullscales)
 
     if len(factors) == 0:
       print("No factors generated. Image Shape: {}, Downsample Shape: {}, Volume Shape: {}, Bounds: {}".format(
           image.shape, ds_shape, vol.volume_size, bounds)
       )
 
+    downsamplefn = downsample.method(vol.layer_type, sparse=sparse)
+
     vol.mip = mip
     if not skip_first:
       vol[bounds.to_slices()] = image
 
-    if len(factors) == 0:
-      return
-
-    num_mips = len(factors)
-
-    mips = []
-    if vol.layer_type == 'image':
-      mips = tinybrain.downsample_with_averaging(image, factors[0], num_mips=num_mips)
-    elif vol.layer_type == 'segmentation':
-      mips = tinybrain.downsample_segmentation(
-        image, factors[0], 
-        num_mips=num_mips, sparse=sparse
-      )
-    else:
-      mips = tinybrain.downsample_with_striding(image, factors[0], num_mips=num_mips)
-
     new_bounds = bounds.clone()
-   
+
     for factor3 in factors:
       vol.mip += 1
+      image = downsamplefn(image, factor3)
       new_bounds //= factor3
-      mipped = mips.pop(0)
-      new_bounds.maxpt = new_bounds.minpt + Vec(*mipped.shape[:3])
-      vol[new_bounds] = mipped
+      new_bounds.maxpt = new_bounds.minpt + Vec(*image.shape[:3])
+      vol[new_bounds.to_slices()] = image
+
 
 def cache(task, cloudpath):
   layer_path, filename = os.path.split(cloudpath)
@@ -100,6 +92,36 @@ def cache(task, cloudpath):
       f.write(filestr)
 
   return filestr
+
+class IngestTask(RegisteredTask):
+  """Ingests and does downsampling.
+     We want tasks execution to be independent of each other, so that no synchronization is
+     required.
+     The downsample scales should be such that the lowest resolution chunk should be able
+     to be produce from the data available.
+  """
+
+  def __init__(self, chunk_path, chunk_encoding, layer_path):
+    super(IngestTask, self).__init__(chunk_path, chunk_encoding, layer_path)
+    self.chunk_path = chunk_path
+    self.chunk_encoding = chunk_encoding
+    self.layer_path = layer_path
+
+  def execute(self):
+    volume = CloudVolume(self.layer_path, mip=0)
+    bounds = Bbox.from_filename(self.chunk_path)
+    image = self._download_input_chunk(bounds)
+    image = chunks.decode(image, self.chunk_encoding)
+    # BUG: We need to provide some kind of ds_shape independent of the image
+    # otherwise the edges of the dataset may not generate as many mip levels.
+    downsample_and_upload(image, bounds, volume, mip=0,
+                          ds_shape=image.shape[:3])
+
+  def _download_input_chunk(self, bounds):
+    storage = Storage(self.layer_path, n_threads=0)
+    relpath = 'build/{}'.format(bounds.to_filename())
+    return storage.get_file(relpath)
+
 
 class DeleteTask(RegisteredTask):
   """Delete a block of images inside a layer on all mip levels."""
@@ -139,9 +161,6 @@ class BlackoutTask(RegisteredTask):
       cloudpath, mip, shape, 
       offset, value, non_aligned_writes
     )
-    self.shape = Vec(*self.shape)
-    self.offset = Vec(*self.offset)
-
   def execute(self):
     vol = CloudVolume(self.cloudpath, self.mip, non_aligned_writes=self.non_aligned_writes)
     bounds = Bbox(self.offset, self.shape + self.offset)
@@ -159,6 +178,35 @@ class TouchTask(RegisteredTask):
     bounds = Bbox(self.offset, self.shape + self.offset)
     bounds = Bbox.clamp(bounds, vol.bounds)
     image = vol[bounds]
+
+class DownsampleTask(RegisteredTask):
+  def __init__(
+    self, layer_path, mip, shape, offset, 
+    fill_missing=False, axis='z', sparse=False
+  ):
+    super(DownsampleTask, self).__init__(
+      layer_path, mip, shape, offset, 
+      fill_missing, axis, sparse
+    )
+    self.layer_path = layer_path
+    self.mip = mip
+    self.shape = Vec(*shape)
+    self.offset = Vec(*offset)
+    self.fill_missing = fill_missing
+    self.axis = axis
+    self.sparse = sparse
+
+  def execute(self):
+    vol = CloudVolume(self.layer_path, self.mip,
+                      fill_missing=self.fill_missing)
+    bounds = Bbox(self.offset, self.shape + self.offset)
+    bounds = Bbox.clamp(bounds, vol.bounds)
+    image = vol[ bounds.to_slices() ]
+    downsample_and_upload(
+      image, bounds, vol, 
+      self.shape, self.mip, self.axis, 
+      skip_first=True, sparse=self.sparse
+    )
 
 class QuantizeTask(RegisteredTask):
   def __init__(self, source_layer_path, dest_layer_path, shape, offset, mip, fill_missing=False):
@@ -183,6 +231,229 @@ class QuantizeTask(RegisteredTask):
 
     destvol = CloudVolume(self.dest_layer_path, mip=self.mip)
     downsample_and_upload(image, bounds, destvol, self.shape, mip=self.mip, axis='z')
+
+
+class MeshTask(RegisteredTask):
+  def __init__(self, shape, offset, layer_path, **kwargs):
+    super(MeshTask, self).__init__(shape, offset, layer_path, **kwargs)
+    self.shape = Vec(*shape)
+    self.offset = Vec(*offset)
+    self.layer_path = layer_path
+    self.options = {
+        'lod': kwargs.get('lod', 0),
+        'mip': kwargs.get('mip', 0),
+        'simplification_factor': kwargs.get('simplification_factor', 100),
+        'max_simplification_error': kwargs.get('max_simplification_error', 40),
+        'mesh_dir': kwargs.get('mesh_dir', None),
+        'remap_table': kwargs.get('remap_table', None),
+        'generate_manifests': kwargs.get('generate_manifests', False),
+        'low_padding': kwargs.get('low_padding', 0),
+        'high_padding': kwargs.get('high_padding', 1),
+        'parallel_download': kwargs.get('parallel_download', 1),
+        'cache_control': kwargs.get('cache_control', None)
+    }
+
+  def execute(self):
+    self._volume = CloudVolume(
+        self.layer_path, self.options['mip'], bounded=False,
+        parallel=self.options['parallel_download'])
+    self._bounds = Bbox(self.offset, self.shape + self.offset)
+    self._bounds = Bbox.clamp(self._bounds, self._volume.bounds)
+
+    self._mesher = Mesher(self._volume.resolution)
+
+    # Marching cubes loves its 1vx overlaps.
+    # This avoids lines appearing between
+    # adjacent chunks.
+    data_bounds = self._bounds.clone()
+    data_bounds.minpt -= self.options['low_padding']
+    data_bounds.maxpt += self.options['high_padding']
+
+    self._mesh_dir = None
+    if self.options['mesh_dir'] is not None:
+      self._mesh_dir = self.options['mesh_dir']
+    elif 'mesh' in self._volume.info:
+      self._mesh_dir = self._volume.info['mesh']
+
+    if not self._mesh_dir:
+      raise ValueError("The mesh destination is not present in the info file.")
+
+    # chunk_position includes the overlap specified by low_padding/high_padding
+    self._data = self._volume[data_bounds.to_slices()]
+    self._remap()
+    self._compute_meshes()
+
+  def _remap(self):
+    if self.options['remap_table'] is not None:
+      actual_remap = {
+          int(k): int(v) for k, v in self.options['remap_table'].items()
+      }
+
+      self._remap_list = [0] + list(actual_remap.values())
+      enumerated_remap = {int(v): i for i, v in enumerate(self._remap_list)}
+
+      do_remap = lambda x: enumerated_remap[actual_remap.get(x, 0)]
+      self._data = np.vectorize(do_remap)(self._data)
+
+  def _compute_meshes(self):
+    with Storage(self.layer_path) as storage:
+      data = self._data[:, :, :, 0].T
+      self._mesher.mesh(data)
+      for obj_id in self._mesher.ids():
+        if self.options['remap_table'] is None:
+          remapped_id = obj_id
+        else:
+          remapped_id = self._remap_list[obj_id]
+
+        storage.put_file(
+            file_path='{}/{}:{}:{}'.format(
+                self._mesh_dir, remapped_id, self.options['lod'],
+                self._bounds.to_filename()
+            ),
+            content=self._create_mesh(obj_id),
+            compress=True,
+            cache_control=self.options['cache_control']
+        )
+
+        if self.options['generate_manifests']:
+          fragments = []
+          fragments.append('{}:{}:{}'.format(remapped_id, self.options['lod'],
+                                             self._bounds.to_filename()))
+
+          storage.put_file(
+              file_path='{}/{}:{}'.format(
+                  self._mesh_dir, remapped_id, self.options['lod']),
+              content=json.dumps({"fragments": fragments}),
+              content_type='application/json',
+              cache_control=self.options['cache_control']
+          )
+
+  def _create_mesh(self, obj_id):
+    mesh = self._mesher.get_mesh(
+        obj_id,
+        simplification_factor=self.options['simplification_factor'],
+        max_simplification_error=self.options['max_simplification_error']
+    )
+    vertices = self._update_vertices(
+        np.array(mesh['points'], dtype=np.float32))
+    vertex_index_format = [
+        np.uint32(len(vertices) / 3), # Number of vertices (3 coordinates)
+        vertices,
+        np.array(mesh['faces'], dtype=np.uint32)
+    ]
+    return b''.join([array.tobytes() for array in vertex_index_format])
+
+  def _update_vertices(self, points):
+    # zi_lib meshing multiplies vertices by 2.0 to avoid working with floats,
+    # but we need to recover the exact position for display
+    # Note: points are already multiplied by resolution, but missing the offset
+    points /= 2.0
+    resolution = self._volume.resolution
+    xmin, ymin, zmin = self._bounds.minpt - self.options['low_padding']
+    points[0::3] = points[0::3] + xmin * resolution.x
+    points[1::3] = points[1::3] + ymin * resolution.y
+    points[2::3] = points[2::3] + zmin * resolution.z
+    return points
+
+
+class collection_segid():
+    segids_coll = []
+    def recive_segid(self, get_segid):
+        print("receive_segid function!!!!!!!!")
+        print(get_segid)
+        self.segids_coll.append(get_segid)
+    
+    def get_segids(self):
+        return self.segids_coll
+        
+
+class MeshManifestTask(RegisteredTask):
+  """
+  Finalize mesh generation by post-processing chunk fragment
+  lists into mesh fragment manifests.
+  These are necessary for neuroglancer to know which mesh
+  fragments to download for a given segid.
+
+  If we parallelize using prefixes single digit prefixes ['0','1',..'9'] all meshes will
+  be correctly processed. But if we do ['10','11',..'99'] meshes from [0,9] won't get
+  processed and need to be handle specifically by creating tasks that will process
+  a single mesh ['0:','1:',..'9:']
+  """
+  def __init__(self, layer_path, prefix, lod=0, mesh_dir=None):
+    super(MeshManifestTask, self).__init__(layer_path, prefix)
+    self.layer_path = layer_path
+    self.lod = lod
+    self.prefix = prefix
+    self.mesh_dir = mesh_dir 
+        
+  def execute(self):
+    with Storage(self.layer_path) as storage:
+      self._info = json.loads(storage.get_file('info').decode('utf8'))
+
+      if self.mesh_dir is None and 'mesh' in self._info:
+        self.mesh_dir = self._info['mesh']
+
+      self._generate_manifests(storage)
+      
+  def _get_mesh_filenames_subset(self, storage):
+    prefix = '{}/{}'.format(self.mesh_dir, self.prefix)
+    segids = defaultdict(list)
+
+    for filename in storage.list_files(prefix=prefix):
+      filename = os.path.basename(filename)
+      # `match` implies the beginning (^). `search` matches whole string
+#      print(filename) # 960:0:0-64_128-256_128-256
+
+      matches = re.search(r'(\d+):(\d+):', filename)
+
+      if not matches:
+        continue
+
+      segid, lod = matches.groups()
+      segid, lod = int(segid), int(lod)
+
+      if lod != self.lod:
+        continue
+
+      segids[segid].append(filename)
+
+    return segids
+
+  def _file_path_process(self, file1_dir):
+    file_dir_replace = file1_dir.replace("file://", "")
+    generated_file_dir = file_dir_replace.strip('/').split('/')
+    file_index = generated_file_dir.__len__()
+    file_name = generated_file_dir[file_index-1]
+
+    return file_dir_replace, file_name
+  
+  def _generate_manifests(self, storage):
+    segids = self._get_mesh_filenames_subset(storage)   
+
+    file_path, file_name = self._file_path_process(self.layer_path)  #this state is wait minute because of google storage
+                            
+    file = open(file_path + "/" + file_name +".txt", 'a')  #this state is wait minute because of google storage
+    
+    for segid, frags in tqdm(segids.items()):
+#      save_segid.recive_segid(segid)         # use DataBase
+#      self.segid_s.append(segid)
+      #collection_segid.recive_segid(segid)  
+      
+      segid_str = str(segid)
+      file.write(segid_str)  #this state is wait minute because of google storage
+      file.write('\n')       #this state is wait minute because of google storage 
+      
+#      print("in tasks source file")
+#      print(segid)
+#      print(frags)
+     
+      storage.put_file(
+          file_path='{}/{}:{}'.format(self.mesh_dir, segid, self.lod),
+          content=json.dumps({"fragments": frags}),
+          content_type='application/json',     
+      )
+    file.close() #this state is wait minute because of google storage
+  
 
 # class BigArrayTask(RegisteredTask):
 #   def __init__(self, layer_path, chunk_path, chunk_encoding, version):
@@ -491,21 +762,13 @@ class ContrastNormalizationTask(RegisteredTask):
     self.fill_missing = fill_missing
     self.translate = Vec(*translate)
     self.mip = int(mip)
-    if isinstance(clip_fraction, Sequence):
-      assert len(clip_fraction) == 2
-      self.lower_clip_fraction = float(clip_fraction[0])
-      self.upper_clip_fraction = float(clip_fraction[1])
-    else:
-      self.lower_clip_fraction = self.upper_clip_fraction = float(clip_fraction)
-
+    self.clip_fraction = float(clip_fraction)
     self.minval = minval 
     self.maxval = maxval
 
     self.levels_path = levels_path if levels_path else self.src_path
 
-    assert 0 <= self.lower_clip_fraction <= 1
-    assert 0 <= self.upper_clip_fraction <= 1
-    assert self.lower_clip_fraction + self.upper_clip_fraction <= 1
+    assert 0 <= self.clip_fraction <= 1
 
   def execute(self):
     srccv = CloudVolume(
@@ -526,7 +789,7 @@ class ContrastNormalizationTask(RegisteredTask):
       imagez = z - bounds.minpt.z
       zlevel = zlevels[imagez]
       (lower, upper) = self.find_section_clamping_values(
-          zlevel, self.lower_clip_fraction, 1 - self.upper_clip_fraction)
+          zlevel, self.clip_fraction, 1 - self.clip_fraction)
       if lower == upper:
         continue
       img = image[:, :, imagez]
@@ -688,113 +951,35 @@ class LuminanceLevelsTask(RegisteredTask):
       bboxes.append(bbox)
     return bboxes
 
+
 class TransferTask(RegisteredTask):
   # translate = change of origin
   def __init__(
     self, src_path, dest_path, 
-    mip, shape, offset, 
-    translate=(0,0,0),
-    fill_missing=False, 
-    skip_first=False, 
-    skip_downsamples=False,
-    delete_black_uploads=False, 
-    background_color=0,
-    sparse=False,
-    axis='z',
-    agglomerate=False,
-    timestamp=None,
-    compress='gzip',
-    factor=None,
+    shape, offset, fill_missing, 
+    translate, mip=0
   ):
     super(TransferTask, self).__init__(
-      src_path, dest_path, 
-      mip, shape, offset, 
-      translate, fill_missing, 
-      skip_first, skip_downsamples,
-      delete_black_uploads, background_color,
-      sparse, axis, agglomerate, timestamp, 
-      compress, factor
+        src_path, dest_path, shape, 
+        offset, fill_missing, translate, 
+        mip
     )
     self.src_path = src_path
     self.dest_path = dest_path
-    self.mip = mip
     self.shape = Vec(*shape)
     self.offset = Vec(*offset)
-    self.fill_missing = bool(fill_missing)
+    self.fill_missing = fill_missing
     self.translate = Vec(*translate)
-    self.delete_black_uploads = bool(delete_black_uploads)
-    self.sparse = bool(sparse)
-    self.skip_first = bool(skip_first)
-    self.skip_downsamples = bool(skip_downsamples)
-    self.background_color = background_color
-    self.axis = axis
-    self.factor = factor
-    self.sparse = sparse
-    self.agglomerate = agglomerate
-    self.timestamp = timestamp
-    self.compress = compress
+    self.mip = int(mip)
 
   def execute(self):
-    srccv = CloudVolume(
-      self.src_path, fill_missing=self.fill_missing,
-      mip=self.mip, bounded=False
-    )
-    destcv = CloudVolume(
-      self.dest_path, fill_missing=self.fill_missing,
-      mip=self.mip, delete_black_uploads=self.delete_black_uploads,
-      background_color=self.background_color, compress=self.compress
-    )
+    srccv = CloudVolume(self.src_path, fill_missing=self.fill_missing, mip=self.mip)
+    destcv = CloudVolume(self.dest_path, fill_missing=self.fill_missing, mip=self.mip)
 
-    dst_bounds = Bbox(self.offset, self.shape + self.offset)
-    dst_bounds = Bbox.clamp(dst_bounds, destcv.bounds)
-    src_bounds = dst_bounds - self.translate
-    image = srccv.download(
-      src_bounds, agglomerate=self.agglomerate, timestamp=self.timestamp
-    )
-
-    if self.skip_downsamples:
-      destcv[dst_bounds] = image
-    else:
-      downsample_and_upload(
-        image, dst_bounds, destcv,
-        self.shape, mip=self.mip,
-        skip_first=self.skip_first,
-        sparse=self.sparse, axis=self.axis,
-        factor=self.factor
-      )
-
-class DownsampleTask(TransferTask):
-  """
-  Downsamples a cutout of the volume. By default it performs 
-  2x2x1 downsamples along the specified axis. The factor argument
-  overrrides this functionality.
-  """
-  def __init__(
-    self, layer_path, mip, shape, offset, 
-    fill_missing=False, axis='z', sparse=False,
-    delete_black_uploads=False, background_color=0,
-    dest_path=None, compress="gzip", factor=None
-  ):
-    self.layer_type = layer_path
-
-    if dest_path is None:
-      dest_path = layer_path
-
-    super(DownsampleTask, self).__init__(
-      layer_path, dest_path, 
-      mip, shape, offset, 
-      translate=(0,0,0),
-      fill_missing=fill_missing, 
-      skip_first=True, 
-      skip_downsamples=False,
-      delete_black_uploads=delete_black_uploads, 
-      background_color=background_color,
-      sparse=sparse,
-      axis=axis,
-      compress=compress,
-      factor=factor,
-    )
-
+    bounds = Bbox(self.offset, self.shape + self.offset)
+    image = srccv[bounds.to_slices()]
+    bounds += self.translate
+    downsample_and_upload(image, bounds, destcv, self.shape, mip=self.mip)
 
 
 class WatershedRemapTask(RegisteredTask):
